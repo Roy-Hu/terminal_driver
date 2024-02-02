@@ -7,13 +7,24 @@
 #include <terminals.h>  /* Definitions of the the user level routines */
 #include <threads.h>	/* COMP 421 threads package definitions */
 
-#define BUF_SIZE 64  
+#define BUF_SIZE 1024  
 
-static int num_readers, num_writers, num_echo, r_reg_num, w_reg_num;
+#define IDLE 0
+#define WAIT 1
+#define BUSY 2
+
+static int num_readers[NUM_TERMINALS], num_writers[NUM_TERMINALS];
+static int num_echo, r_reg_num, w_reg_num;
 static cond_id_t readers, writers, echo, r_reg, w_reg;
 
 static char *echo_buf[NUM_TERMINALS];
 static int end_echo_buf[NUM_TERMINALS];
+
+static char *write_buf[NUM_TERMINALS];
+static int end_write_buf[NUM_TERMINALS];
+
+static int echo_state;
+static int write_state;
 
 extern void 
 ReceiveInterrupt(int term) 
@@ -28,20 +39,23 @@ ReceiveInterrupt(int term)
     
     r_reg_num--;
 
-    while (num_echo > 0) CondWait(echo);
+    while (num_echo > 0 || w_reg_num > 0) {
+        echo_state = WAIT;
+        CondWait(echo);
+    }
 
+    echo_state = BUSY;
     num_echo++;
 
     echo_buf[term][end_echo_buf[term]++] = c;
     
-    end_echo_buf[term]--;
-
-    for (int i = 0; i < end_echo_buf[term]; i++) {
+    for (int i = 0; i < end_echo_buf[term] - 1; i++) {
         echo_buf[term][i] = echo_buf[term][i + 1];
     }
     
-    WriteDataRegister(term, echo_buf[term][0]);
+    end_echo_buf[term]--;
 
+    WriteDataRegister(term, echo_buf[term][0]);
 }
 
 extern int 
@@ -57,9 +71,27 @@ TransmitInterrupt(int term)
 {
     Declare_Monitor_Entry_Procedure();
     
+    if (num_echo > 0) {
+        num_echo--;
+    } else if (w_reg_num > 0){
+        w_reg_num--;
+    }
 
-    num_echo--;
-    CondSignal(echo);
+
+    // Make sure echo have the higher piorirty
+    if (echo_state == WAIT) {
+        CondSignal(echo);
+    } else {
+        // If there are no echo waiting, set it's state to idle
+        echo_state = IDLE;
+
+        // If there are w_reg waiting, signal w_reg
+        if (write_state == WAIT) {
+            CondSignal(w_reg);
+        } else {
+            write_state = IDLE;
+        }
+    }
 }
 
 extern int 
@@ -67,23 +99,39 @@ WriteTerminal(int term, char *buf, int buflen)
 {
     Declare_Monitor_Entry_Procedure();
 
-    while (num_writers > 0) CondWait(writers);
+    while (num_writers[term] > 0) CondWait(writers);
     
-    num_writers++;
+    num_writers[term]++;
 
-    int out_char = 0;
+    int write_char_num = 0;
     for (int i = 0; i < buflen && i < BUF_SIZE; i++) {
+        while (num_echo > 0 || w_reg_num > 0) {
+            write_state = WAIT;
+            CondWait(w_reg);
+        } 
 
-        printf("%c", buf[i]);
+        w_reg_num++;
+        write_state = BUSY;
+        
+        write_buf[term][end_write_buf[term]++] = buf[i];
+        
+        for (int i = 0; i < end_write_buf[term] - 1; i++) {
+            write_buf[term][i] = write_buf[term][i + 1];
+        }
+        
+        end_write_buf[term]--;
 
-        out_char++;
+        WriteDataRegister(term, write_buf[term][0]);
+
+        write_char_num++;
+        printf("[DEBUG][TERM %d] Write Char Num %d / Buf len %d\n", term, write_char_num, buflen);
     }
 
-    num_writers--;
+    num_writers[term]--;
 
     CondSignal(writers);
 
-    return out_char;
+    return write_char_num;
 }
 
 extern int 
@@ -95,6 +143,12 @@ InitTerminal(int term)
 
     echo_buf[term] = (char *)malloc(BUF_SIZE * sizeof(char));
     end_echo_buf[term] = 0;
+
+    write_buf[term] = (char *)malloc(BUF_SIZE * sizeof(char));
+    end_write_buf[term] = 0;
+    
+    num_readers[term] = 0;
+    num_writers[term] = 0;
 
     return 0;
 }
@@ -111,12 +165,14 @@ InitTerminalDriver(void)
     r_reg = CondCreate();
     w_reg = CondCreate();
 
-    num_readers = 0;
-    num_writers = 0;
+
     num_echo = 0;
     r_reg_num = 0;
     w_reg_num = 0;
 
+    echo_state = IDLE;
+    write_state = IDLE;
+    
     return 0;
 }
 
