@@ -14,8 +14,16 @@
 #define BUSY 2
 
 static int num_readers[NUM_TERMINALS], num_writers[NUM_TERMINALS];
+
+// lock for the driver
+static cond_id_t reader[NUM_TERMINALS], writer[NUM_TERMINALS];
+
+// lock for the hardware
+static cond_id_t echo, r_reg, w_reg;
+
 static int num_echo, r_reg_num, w_reg_num;
-static cond_id_t readers, writers, echo, r_reg, w_reg;
+
+static int echo_state;
 
 static char *echo_buf[NUM_TERMINALS];
 static int end_echo_buf[NUM_TERMINALS];
@@ -23,8 +31,6 @@ static int end_echo_buf[NUM_TERMINALS];
 static char *write_buf[NUM_TERMINALS];
 static int end_write_buf[NUM_TERMINALS];
 
-static int echo_state;
-static int write_state;
 
 extern void 
 ReceiveInterrupt(int term) 
@@ -77,7 +83,6 @@ TransmitInterrupt(int term)
         w_reg_num--;
     }
 
-
     // Make sure echo have the higher piorirty
     if (echo_state == WAIT) {
         CondSignal(echo);
@@ -85,12 +90,7 @@ TransmitInterrupt(int term)
         // If there are no echo waiting, set it's state to idle
         echo_state = IDLE;
 
-        // If there are w_reg waiting, signal w_reg
-        if (write_state == WAIT) {
-            CondSignal(w_reg);
-        } else {
-            write_state = IDLE;
-        }
+        CondSignal(w_reg);
     }
 }
 
@@ -99,19 +99,17 @@ WriteTerminal(int term, char *buf, int buflen)
 {
     Declare_Monitor_Entry_Procedure();
 
-    while (num_writers[term] > 0) CondWait(writers);
+    while (num_writers[term] > 0) CondWait(writer[term]);
     
     num_writers[term]++;
 
     int write_char_num = 0;
     for (int i = 0; i < buflen && i < BUF_SIZE; i++) {
         while (num_echo > 0 || w_reg_num > 0) {
-            write_state = WAIT;
             CondWait(w_reg);
         } 
 
         w_reg_num++;
-        write_state = BUSY;
         
         write_buf[term][end_write_buf[term]++] = buf[i];
         
@@ -129,7 +127,7 @@ WriteTerminal(int term, char *buf, int buflen)
 
     num_writers[term]--;
 
-    CondSignal(writers);
+    CondSignal(writer[term]);
 
     return write_char_num;
 }
@@ -150,6 +148,9 @@ InitTerminal(int term)
     num_readers[term] = 0;
     num_writers[term] = 0;
 
+    reader[term] = CondCreate();
+    writer[term] = CondCreate();
+
     return 0;
 }
 
@@ -158,9 +159,6 @@ InitTerminalDriver(void)
 {
     Declare_Monitor_Entry_Procedure();
 
-    // create condition variables
-    readers = CondCreate();
-    writers = CondCreate();
     echo = CondCreate();
     r_reg = CondCreate();
     w_reg = CondCreate();
@@ -171,7 +169,6 @@ InitTerminalDriver(void)
     w_reg_num = 0;
 
     echo_state = IDLE;
-    write_state = IDLE;
     
     return 0;
 }
