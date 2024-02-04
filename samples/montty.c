@@ -7,16 +7,16 @@
 #include <terminals.h>  /* Definitions of the the user level routines */
 #include <threads.h>	/* COMP 421 threads package definitions */
 
-#define BUF_SIZE 1024  
+#define BUF_SIZE 512  
 
 #define IDLE 0
 #define WAIT 1
 #define BUSY 2
 
-static int num_readers[NUM_TERMINALS], num_writers[NUM_TERMINALS];
+static int num_readers[NUM_TERMINALS], num_writers[NUM_TERMINALS], num_read[NUM_TERMINALS];
 
 // lock for the driver
-static cond_id_t reader[NUM_TERMINALS], writer[NUM_TERMINALS];
+static cond_id_t reader[NUM_TERMINALS], writer[NUM_TERMINALS], read[NUM_TERMINALS];
 
 // lock for the hardware
 static cond_id_t echo, r_reg, w_reg;
@@ -31,6 +31,8 @@ static int end_echo_buf[NUM_TERMINALS];
 static char *write_buf[NUM_TERMINALS];
 static int end_write_buf[NUM_TERMINALS];
 
+static char *read_buf[NUM_TERMINALS];
+static int end_read_buf[NUM_TERMINALS];
 
 extern void 
 ReceiveInterrupt(int term) 
@@ -44,6 +46,18 @@ ReceiveInterrupt(int term)
     char c = ReadDataRegister(term);
     
     r_reg_num--;
+
+    while (num_read[term] > 0) {
+        CondWait(read[term]);
+    }
+
+    num_read[term]++;
+
+    read_buf[term][end_read_buf[term]++] = c;
+
+    num_read[term]--;
+
+    CondSignal(read[term]);
 
     while (num_echo > 0 || w_reg_num > 0) {
         echo_state = WAIT;
@@ -69,6 +83,31 @@ ReadTerminal(int term, char *buf, int buflen)
 {
     Declare_Monitor_Entry_Procedure();
 
+    while (num_readers[term] > 0) CondWait(reader[term]);
+
+    num_readers[term]++;
+
+    for (int i = 0; i < buflen && end_read_buf[term] < BUF_SIZE; i++) {
+        // Wait while there are no char in the read buf
+        while (num_read[term] > 0 || end_read_buf[term] == 0) CondWait(read[term]);
+
+        num_read[term]++;
+    
+        for (int j = 0; j < end_read_buf[term]; j++) {
+            buf[i] = read_buf[term][j];
+        }
+
+        end_read_buf[term] = 0;
+
+        num_read[term]--;
+
+        CondSignal(read[term]);
+    }
+
+    num_readers[term]--;
+
+    CondSignal(reader[term]);
+    
     return 0;
 }
 
@@ -104,7 +143,7 @@ WriteTerminal(int term, char *buf, int buflen)
     num_writers[term]++;
 
     int write_char_num = 0;
-    for (int i = 0; i < buflen && i < BUF_SIZE; i++) {
+    for (int i = 0; i < buflen && end_write_buf[term] < BUF_SIZE; i++) {
         while (num_echo > 0 || w_reg_num > 0) {
             CondWait(w_reg);
         } 
@@ -145,11 +184,16 @@ InitTerminal(int term)
     write_buf[term] = (char *)malloc(BUF_SIZE * sizeof(char));
     end_write_buf[term] = 0;
     
+    read_buf[term] = (char *)malloc(BUF_SIZE * sizeof(char));
+    end_read_buf[term] = 0;
+
     num_readers[term] = 0;
     num_writers[term] = 0;
+    num_read[term] = 0;
 
     reader[term] = CondCreate();
     writer[term] = CondCreate();
+    read[term] = CondCreate();
 
     return 0;
 }
@@ -162,7 +206,6 @@ InitTerminalDriver(void)
     echo = CondCreate();
     r_reg = CondCreate();
     w_reg = CondCreate();
-
 
     num_echo = 0;
     r_reg_num = 0;
