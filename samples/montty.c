@@ -13,7 +13,7 @@
 #define WAIT 1
 #define BUSY 2
 
-static int num_readers[NUM_TERMINALS], num_writers[NUM_TERMINALS], num_read[NUM_TERMINALS];
+static int num_readers[NUM_TERMINALS], num_writers[NUM_TERMINALS];
 
 // lock for the driver
 static cond_id_t reader[NUM_TERMINALS], writer[NUM_TERMINALS], read[NUM_TERMINALS];
@@ -47,35 +47,54 @@ ReceiveInterrupt(int term)
     
     r_reg_num--;
 
-    while (num_read[term] > 0) {
-        CondWait(read[term]);
+    CondSignal(r_reg);
+
+    if (c == '\r') c = '\n';
+
+    printf("[DEBUG][INTERRUPT][TERM %d] Accumulate read buf len %d\n", term, end_read_buf[term]);
+
+    if (end_read_buf[term] < BUF_SIZE) {
+        read_buf[term][end_read_buf[term]++] = c;
+        // Need to wake up the reader if there are originaly have no char in the read buf
+        if (end_read_buf[term] == 1) CondSignal(read[term]);
+    } else {
+        printf("[WARNING][INTERRUPT][TERM %d] Read Buf Full\n", term);
     }
 
-    num_read[term]++;
-
-    read_buf[term][end_read_buf[term]++] = c;
-
-    num_read[term]--;
-
-    CondSignal(read[term]);
-
-    while (num_echo > 0 || w_reg_num > 0) {
-        echo_state = WAIT;
-        CondWait(echo);
+    if (end_echo_buf[term] < BUF_SIZE) {
+        if (c == '\n' && end_echo_buf[term] >= BUF_SIZE - 1) {
+            printf("[DEBUG][INTERRUPT][TERM %d] Echo Buf is Full, do not have space for \\r\\n\n", term);           
+        } else {
+            if (c == '\n') echo_buf[term][end_echo_buf[term]++] = '\r';
+            echo_buf[term][end_echo_buf[term]++] = c;
+        }
+    } else {
+        printf("[DEBUG][INTERRUPT][TERM %d] Echo Buf Full\n", term);
     }
 
-    echo_state = BUSY;
-    num_echo++;
+    int echo_char_num = 0;
+    int echo_char_in_buf = end_echo_buf[term];
 
-    echo_buf[term][end_echo_buf[term]++] = c;
-    
-    for (int i = 0; i < end_echo_buf[term] - 1; i++) {
-        echo_buf[term][i] = echo_buf[term][i + 1];
+    // Echo all the char in the echo buf
+    printf("[DEBUG][INTERRUPT][TERM %d] Accumulate echo buf len %d\n", term, end_echo_buf[term]);
+
+    while (echo_char_in_buf != echo_char_num) {
+        while (num_echo > 0 || w_reg_num > 0) {
+            echo_state = WAIT;
+            CondWait(echo);
+        }
+
+        echo_state = BUSY;
+        num_echo++;
+
+        WriteDataRegister(term, echo_buf[term][echo_char_num++]);
     }
-    
-    end_echo_buf[term]--;
 
-    WriteDataRegister(term, echo_buf[term][0]);
+    for (int i = 0; i + echo_char_in_buf < end_echo_buf[term]; i++) {
+        echo_buf[term][i] = echo_buf[term][i + echo_char_in_buf];
+    }
+
+    end_echo_buf[term] -= echo_char_in_buf;
 }
 
 extern int 
@@ -87,28 +106,39 @@ ReadTerminal(int term, char *buf, int buflen)
 
     num_readers[term]++;
 
-    for (int i = 0; i < buflen && end_read_buf[term] < BUF_SIZE; i++) {
+    bool newline = false;
+    int cnt;
+    for (cnt = 0; cnt < buflen && end_read_buf[term] < BUF_SIZE; cnt++) {
         // Wait while there are no char in the read buf
-        while (num_read[term] > 0 || end_read_buf[term] == 0) CondWait(read[term]);
+        while (end_read_buf[term] == 0) CondWait(read[term]);
+        
+        printf("[DEBUG][INTERRUPT][TERM %d] Accumulate read buf len %d\n", term, end_read_buf[term]);
 
-        num_read[term]++;
-    
-        for (int j = 0; j < end_read_buf[term]; j++) {
-            buf[i] = read_buf[term][j];
+        int read_char_in_buf = end_read_buf[term];
+        int read_char_num = 0;
+
+        while (read_char_in_buf != read_char_num && cnt < buflen) {
+            buf[cnt++] = read_buf[term][read_char_num++];
+            if (buf[cnt - 1] == '\n') {
+                newline = true;
+                break;
+            }
+        }
+        
+        for (int i = 0; i + read_char_num < end_read_buf[term]; i++) {
+            read_buf[term][i] = read_buf[term][i + read_char_in_buf];
         }
 
-        end_read_buf[term] = 0;
+        end_read_buf[term] -= read_char_num;
 
-        num_read[term]--;
-
-        CondSignal(read[term]);
+        if (newline) break;
     }
 
     num_readers[term]--;
 
     CondSignal(reader[term]);
     
-    return 0;
+    return cnt;
 }
 
 extern void 
@@ -158,6 +188,10 @@ WriteTerminal(int term, char *buf, int buflen)
         
         end_write_buf[term]--;
 
+        if (write_buf[term][0] == '\n') {
+            WriteDataRegister(term, '\r');
+        }
+
         WriteDataRegister(term, write_buf[term][0]);
 
         write_char_num++;
@@ -189,7 +223,6 @@ InitTerminal(int term)
 
     num_readers[term] = 0;
     num_writers[term] = 0;
-    num_read[term] = 0;
 
     reader[term] = CondCreate();
     writer[term] = CondCreate();
