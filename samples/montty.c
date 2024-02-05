@@ -9,10 +9,6 @@
 
 #define BUF_SIZE 512  
 
-#define IDLE 0
-#define WAIT 1
-#define BUSY 2
-
 static int num_readers[NUM_TERMINALS], num_writers[NUM_TERMINALS];
 
 // lock for the driver
@@ -21,9 +17,7 @@ static cond_id_t reader[NUM_TERMINALS], writer[NUM_TERMINALS], read[NUM_TERMINAL
 // lock for the hardware
 static cond_id_t echo, r_reg, w_reg;
 
-static int num_echo, r_reg_num, w_reg_num;
-
-static int echo_state;
+static int num_echo, num_echo_wait, r_reg_num, w_reg_num;
 
 static char *echo_buf[NUM_TERMINALS];
 static int end_echo_buf[NUM_TERMINALS];
@@ -78,13 +72,19 @@ ReceiveInterrupt(int term)
     // Echo all the char in the echo buf
     printf("[DEBUG][INTERRUPT][TERM %d] Accumulate echo buf len %d\n", term, end_echo_buf[term]);
 
+    bool wait = false;
     while (echo_char_in_buf != echo_char_num) {
         while (num_echo > 0 || w_reg_num > 0) {
-            echo_state = WAIT;
+            num_echo_wait++;
+            wait = true;
             CondWait(echo);
         }
 
-        echo_state = BUSY;
+        if (wait) {
+            num_echo_wait--;
+            wait = false;
+        }
+        
         num_echo++;
 
         WriteDataRegister(term, echo_buf[term][echo_char_num++]);
@@ -153,12 +153,10 @@ TransmitInterrupt(int term)
     }
 
     // Make sure echo have the higher piorirty
-    if (echo_state == WAIT) {
+    if (num_echo_wait > 0) {
         CondSignal(echo);
     } else {
-        // If there are no echo waiting, set it's state to idle
-        echo_state = IDLE;
-
+        // If there are no echo waiting, wake up the writer
         CondSignal(w_reg);
     }
 }
@@ -244,7 +242,7 @@ InitTerminalDriver(void)
     r_reg_num = 0;
     w_reg_num = 0;
 
-    echo_state = IDLE;
+    num_echo_wait = 0;
     
     return 0;
 }
