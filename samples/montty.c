@@ -8,6 +8,7 @@
 #include <threads.h>	/* COMP 421 threads package definitions */
 
 #define BUF_SIZE 512  
+#define BYPASS_LIMIT 1
 
 static bool isInit[NUM_TERMINALS];
 static bool isInitMonitor = false;
@@ -23,6 +24,9 @@ static cond_id_t write;
 int num_last_write[NUM_TERMINALS];
 
 static int num_echo, num_write, num_stas;
+
+static int waiting_write[NUM_TERMINALS];
+static int bypass_echo[NUM_TERMINALS], bypass_write[NUM_TERMINALS];
 
 static int tty_in[NUM_TERMINALS], tty_out[NUM_TERMINALS], user_in[NUM_TERMINALS], user_out[NUM_TERMINALS];
 static int tty_in_tmp[NUM_TERMINALS], tty_out_tmp[NUM_TERMINALS], user_in_tmp[NUM_TERMINALS], user_out_tmp[NUM_TERMINALS];
@@ -65,8 +69,25 @@ removeItem(char *buf, int *out, int *cnt)
 static void
 SafeWriteReg(int term, char c)
 {
-    while (num_echo > 0 || num_write > 0) {
+    bool bypass_limit = false;
+    for (int i = 0; i < NUM_TERMINALS; i++) {
+        if ((bypass_write[i] > BYPASS_LIMIT || bypass_echo[i] > BYPASS_LIMIT) && i != term) {
+            bypass_limit = true;
+            break;
+        }
+    }
+
+    while (num_echo > 0 || num_write > 0 || bypass_limit) {
+        waiting_write[term]++;
         CondWait(write);
+        waiting_write[term]--;
+    }
+
+    bypass_write[term] = 0;
+
+    for (int i = 0; i < NUM_TERMINALS; i++) {
+        if (waiting_write[i] > 0 && i != term) bypass_write[i]++;
+        if (echo_count[i] > 0 && i != term) bypass_echo[i]++;
     }
 
     num_write++;
@@ -74,6 +95,7 @@ SafeWriteReg(int term, char c)
     WriteDataRegister(term, c);
 }
 
+// Since the finish time of ReceiveInterrupt is fast enought, everyone can access to ReadDataRegister without starvation
 extern void 
 ReceiveInterrupt(int term) 
 {
@@ -202,11 +224,39 @@ TransmitInterrupt(int term)
     }
 
     // Make sure echo have the higher piorirty
-    if (echo_count[term] > 0) {
+    bool next_echo = false;
+    int next_term = 0;
+    
+    for (int i = 0; i < NUM_TERMINALS; i++) {
+        if (echo_count[i] > 0) {
+            next_echo = true;
+            next_term = i;
+        }
+        if (bypass_echo[i] > BYPASS_LIMIT) {
+            next_echo = true;
+            next_term = i;
+            break;
+        }
+    }
+
+    if (next_echo) {
+        for (int i = 0; i < NUM_TERMINALS; i++) {
+            if (echo_count[i] > 0 && i != next_term) {
+                printf("[DEBUG]Bypass echo %d\n", i);
+                bypass_echo[i]++;
+            }
+        }
+
+        if (bypass_write[next_term] > BYPASS_LIMIT) {
+            printf("[DEBUG] Write due to reach Bypass limit %d\n", term);
+        }
+
+        bypass_echo[next_term] = 0;
+
         num_echo++;
 
-        char c = removeItem(echo_buf[term], &echo_out[term], &echo_count[term]);
-        WriteDataRegister(term, c);
+        char c = removeItem(echo_buf[next_term], &echo_out[next_term], &echo_count[next_term]);
+        WriteDataRegister(next_term, c);
     } else {
         if (num_last_write[term] > 0) {
             num_last_write[term]--;
@@ -236,19 +286,20 @@ WriteTerminal(int term, char *buf, int buflen)
         printf("[ERROR]: Buf is NULL\n");
         return -1;
     }
-    
+
     while (num_writers[term] > 0) CondWait(writer[term]);
-    
+
     num_writers[term]++;
 
     int write_char_num = 0;
 
     for (int i = 0; i < buflen; i++) {      
-        if (i == buflen - 1) {
-            num_last_write[term]++;
-        }
+        if (i == buflen - 1) num_last_write[term]++;
 
         if (buf[i] == '\n') {
+            // Special case where the last character is newline
+            if (i == buflen - 1) num_last_write[term]++;
+
             SafeWriteReg(term, '\r');
             SafeWriteReg(term, '\n');
         } else {
@@ -262,8 +313,6 @@ WriteTerminal(int term, char *buf, int buflen)
     while (num_last_write[term] > 0) {
         CondWait(last_write[term]);
     }
-
-    num_last_write[term] = false;
 
     num_writers[term]--;
 
@@ -309,6 +358,8 @@ InitTerminal(int term)
     read[term] = CondCreate();
     last_write[term] = CondCreate();
     num_last_write[term] = 0;
+
+    waiting_write[term] = 0;
 
     tty_in[term] = 0;
     tty_out[term] = 0;
