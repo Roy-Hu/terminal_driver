@@ -8,7 +8,7 @@
 #include <threads.h>	/* COMP 421 threads package definitions */
 
 #define BUF_SIZE 512  
-#define BYPASS_LIMIT 1
+#define BYPASS_LIMIT 10000
 
 static bool isInit[NUM_TERMINALS];
 static bool isInitMonitor = false;
@@ -19,7 +19,7 @@ static int num_readers[NUM_TERMINALS], num_writers[NUM_TERMINALS];
 static cond_id_t reader[NUM_TERMINALS], writer[NUM_TERMINALS], read[NUM_TERMINALS], last_write[NUM_TERMINALS];
 
 // lock for the hardware
-static cond_id_t write;
+static cond_id_t write, stat;
 
 int num_last_write[NUM_TERMINALS];
 
@@ -69,6 +69,7 @@ removeItem(char *buf, int *out, int *cnt)
 static void
 SafeWriteReg(int term, char c)
 {
+    // avoid starvation by checking the bypass limit
     bool bypass_limit = false;
     for (int i = 0; i < NUM_TERMINALS; i++) {
         if ((bypass_write[i] > BYPASS_LIMIT || bypass_echo[i] > BYPASS_LIMIT) && i != term) {
@@ -81,10 +82,19 @@ SafeWriteReg(int term, char c)
         waiting_write[term]++;
         CondWait(write);
         waiting_write[term]--;
+
+        bypass_limit = false;
+        for (int i = 0; i < NUM_TERMINALS; i++) {
+            if ((bypass_write[i] > BYPASS_LIMIT || bypass_echo[i] > BYPASS_LIMIT) && i != term) {
+                bypass_limit = true;
+                break;
+            }
+        }
     }
 
     bypass_write[term] = 0;
 
+    // add the bypass count for other terminals
     for (int i = 0; i < NUM_TERMINALS; i++) {
         if (waiting_write[i] > 0 && i != term) bypass_write[i]++;
         if (echo_count[i] > 0 && i != term) bypass_echo[i]++;
@@ -103,6 +113,8 @@ ReceiveInterrupt(int term)
 
     char c = ReadDataRegister(term);
     
+
+    // Record the snapshot of the statistics at the time TerminalDriverStatistics is called
     if (num_stas > 0) {
         tty_in_tmp[term]++;
     } else {
@@ -112,12 +124,20 @@ ReceiveInterrupt(int term)
     if (c == '\r') c = '\n';
     if (c == '\177') c = '\b';
 
-    if (c == '\b') {
-        read_in[term]--;
-        read_count[term]--;
+    // remove the last character if it is backspace
+    // don't use removeItem since it pop out the first letter instead of the last letter
+    if (c == '\b' ) {
+        if (read_count[term] > 0) {
+            read_count[term]--;
+
+            // read_in should not be negative, however, to prevent unknow error, we use (read_in[term] - 1 + BUF_SIZE) % BUF_SIZE
+            read_in[term] = (read_in[term] - 1 + BUF_SIZE) % BUF_SIZE;
+            printf("new read in%d\n", read_in[term]);
+        }
     } else if (read_count[term] < BUF_SIZE) {
         addItem(read_buf[term], &read_in[term], &read_count[term], c);
 
+        // If the newline is found, wake up the reader
         if (c == '\n') {
             newline_num[term]++;
             CondSignal(read[term]);
@@ -181,10 +201,11 @@ ReadTerminal(int term, char *buf, int buflen)
         } else {
             buf[cnt++] = c;
         }
-
+        // For line-oriented input, stop reading when newline is found
         if (c == '\n') break;
     }
     
+    // If there are no newline, wait for the next newline
     while (newline_num == 0) CondWait(read[term]);
 
     newline_num[term]--;
@@ -225,7 +246,7 @@ TransmitInterrupt(int term)
 
     // Make sure echo have the higher piorirty
     bool next_echo = false;
-    int next_term = 0;
+    int next_term = term;
     
     for (int i = 0; i < NUM_TERMINALS; i++) {
         if (echo_count[i] > 0) {
@@ -380,6 +401,7 @@ InitTerminalDriver(void)
     Declare_Monitor_Entry_Procedure();
 
     write = CondCreate();
+    stat = CondCreate();
 
     num_echo = 0;
     num_write = 0;
@@ -391,7 +413,6 @@ InitTerminalDriver(void)
     for (int i = 0; i < NUM_TERMINALS; i++) {
         isInit[i] = false;
     }
-
 
     return 0;
 }
@@ -406,6 +427,8 @@ TerminalDriverStatistics(struct termstat *stats)
         return -1;
     }
 
+    while (num_stas > 0) CondWait(stat);
+
     num_stas++;
 
     for (int i = 0; i < NUM_TERMINALS; i++) {
@@ -416,16 +439,12 @@ TerminalDriverStatistics(struct termstat *stats)
             stats[i].user_out = -1;
         } else {
             stats[i].tty_in = tty_in[i];
-            tty_in[i] = 0;
 
             stats[i].tty_out = tty_out[i];
-            tty_out[i] = 0;
 
             stats[i].user_in = user_in[i];
-            user_in[i] = 0;
 
             stats[i].user_out = user_out[i];
-            user_out[i] = 0;
         }
     }
     
@@ -448,6 +467,10 @@ TerminalDriverStatistics(struct termstat *stats)
             user_out_tmp[i] = 0;
         } 
     }
+
+    num_stas--;
+
+    CondSignal(stat);
 
     return 0;
 }

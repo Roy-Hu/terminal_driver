@@ -1,5 +1,3 @@
 .vscode
 core*
 *.o
-test*
-utils*
